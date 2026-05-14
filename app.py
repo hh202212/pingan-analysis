@@ -4,93 +4,105 @@ import pandas as pd
 import io
 import re
 
-# 1. 页面配置
-st.set_page_config(page_title="平安建议书表格提取工具", layout="wide")
-st.title("📋 平安人寿建议书表格提取专家")
-st.markdown("---")
+# 页面基础配置
+st.set_page_config(page_title="平安建议书原样提取工具", layout="wide")
+st.title("📄 平安建议书表格“原样”提取工具")
+st.info("功能：保持 PDF 原始嵌套表头结构，仅将数据部分转换为纯数字格式。")
 
-# 核心：强制数值转换函数（解决 Excel 绿三角和计算报错）
-def force_num(val):
+# 核心：精准数字转换（只针对数据，不破坏表头文字）
+def try_to_num(val):
     if val is None or str(val).strip() == "" or str(val).lower() == "none":
-        return 0
-    # 彻底去掉逗号、空格、人民币符号、换行符
-    clean_val = re.sub(r'[^-0-9.]', '', str(val).replace('\n', ''))
-    try:
-        if '.' in clean_val:
-            return float(clean_val)
-        return int(clean_val)
-    except:
-        return 0
+        return "" # 保持原样或为空
+    
+    # 清理掉换行符，方便判断
+    clean_str = str(val).replace('\n', '').strip()
+    
+    # 核心逻辑：如果看起来像数字（包含数字、逗号、百分号等），则尝试转换
+    # 我们只针对包含数字的内容进行清理，纯文字（如表头）会跳过
+    if re.search(r'\d', clean_str):
+        # 去掉逗号、人民币符号、空格等，只留数字、负号和小数点
+        numeric_part = re.sub(r'[^-0-9.]', '', clean_str)
+        try:
+            if '.' in numeric_part:
+                return float(numeric_part)
+            return int(numeric_part)
+        except:
+            return clean_str # 转不动就回退到原始文字
+    return clean_str
 
-# 2. 文件上传
 uploaded_file = st.file_uploader("👉 请上传平安建议书 PDF 文件", type="pdf")
 
 if uploaded_file:
     try:
-        with st.spinner('🔍 正在深度扫描建议书利益演示表...'):
-            all_rows = []
+        with st.spinner('🔍 正在原样提取表格结构...'):
+            all_table_data = []
             with pdfplumber.open(uploaded_file) as pdf:
-                # 扫描 10-20 页，覆盖绝大多数平安建议书的利益演示范围
+                # 扫描 10-20 页（平安利益表核心区间）
                 for page in pdf.pages[10:20]:
+                    # 使用最保守的提取策略，保证结构不乱
                     table = page.extract_table()
                     if table:
-                        all_rows.extend(table)
+                        all_table_data.extend(table)
             
-            if not all_rows:
-                st.error("未能识别到表格数据，请确认 PDF 是否为原件。")
+            if not all_table_data:
+                st.error("未能识别到表格，请确认 PDF 是否为电子版原件。")
             else:
-                # --- A. 智能表头识别 ---
-                header_row = None
-                header_idx = 0
-                for i, r in enumerate(all_rows[:15]): # 在前15行里寻找表头
-                    if '保单年度' in str(r) or '年龄' in str(r):
-                        # 清洗表头文字中的换行符
-                        header_row = [str(item).replace('\n', '') if item else f"列_{idx}" for idx, item in enumerate(r)]
-                        header_idx = i
-                        break
-                
-                # --- B. 数据行提取 ---
-                # 只保留表头下方，且第一列是纯数字（1, 2, 3...）的行
-                data_rows = [r for r in all_rows[header_idx+1:] if str(r[0]).strip().isdigit()]
-                
-                if not data_rows:
-                    st.error("识别到了表头，但未抓取到具体的数字行。")
-                else:
-                    # 组装 DataFrame
-                    df = pd.DataFrame(data_rows, columns=header_row if header_row else None)
+                # --- 核心处理逻辑 ---
+                processed_rows = []
+                for row in all_table_data:
+                    # 对每一行里的每一个格子进行“洗数”
+                    # 如果这行第一列是数字（保单年度），说明是数据行，全行洗数
+                    # 如果不是数字，说明可能是表头，保持文字原样
+                    is_data_row = False
+                    if row[0] and str(row[0]).strip().isdigit():
+                        is_data_row = True
                     
-                    # --- C. 强制全表数值化 (解决绿三角的关键) ---
-                    for col in df.columns:
-                        df[col] = df[col].apply(force_num)
-                    
-                    st.success(f"🎉 成功提取 {len(df)} 行数据！")
-                    
-                    # 3. 页面预览
-                    st.dataframe(df, use_container_width=True)
+                    new_row = []
+                    for cell in row:
+                        if is_data_row:
+                            new_row.append(try_to_num(cell))
+                        else:
+                            # 表头行：仅去掉换行符，不转数字
+                            new_row.append(str(cell).replace('\n', '') if cell else "")
+                    processed_rows.append(new_row)
 
-                    # 4. 导出纯数字 Excel
-                    output = io.BytesIO()
-                    # 使用 xlsxwriter 引擎确保从底层锁定数字格式
-                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                        df.to_excel(writer, index=False, sheet_name='利益演示')
-                        workbook = writer.book
-                        worksheet = writer.sheets['利益演示']
-                        
-                        # 设置 Excel 格式：数字格式 + 字体对齐
-                        num_format = workbook.add_format({'num_format': '#,##0', 'align': 'center', 'font_name': '微软雅黑'})
-                        header_format = workbook.add_format({'bold': True, 'bg_color': '#F2F2F2', 'border': 1, 'align': 'center'})
-                        
-                        # 应用格式
-                        for col_num, value in enumerate(df.columns.values):
-                            worksheet.write(0, col_num, value, header_format)
-                            worksheet.set_column(col_num, col_num, 15, num_format)
+                # 转换为 DataFrame（不设置表头，把表头也当成普通行处理，保持原貌）
+                df = pd.DataFrame(processed_rows)
 
-                    st.download_button(
-                        label="📥 点击下载 Excel 文件",
-                        data=output.getvalue(),
-                        file_name="平安建议书数据提取.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                st.success(f"🎉 成功提取！共计 {len(df)} 行。")
+                st.dataframe(df, use_container_width=True)
+
+                # --- 导出 Excel ---
+                output = io.BytesIO()
+                # 强制使用 xlsxwriter 以支持复杂的单元格写入
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    # header=False 表示不使用 Pandas 默认的 0, 1, 2 表头
+                    df.to_excel(writer, index=False, header=False, sheet_name='建议书原样提取')
+                    
+                    workbook = writer.book
+                    worksheet = writer.sheets['建议书原样提取']
+                    
+                    # 定义数字格式（无绿三角）
+                    num_fmt = workbook.add_format({'num_format': '#,##0', 'font_name': '微软雅黑'})
+                    text_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'font_name': '微软雅黑'})
+                    
+                    # 遍历数据，对数字和文字应用不同的格式
+                    for r_idx, row in enumerate(processed_rows):
+                        for c_idx, cell_val in enumerate(row):
+                            if isinstance(cell_val, (int, float)):
+                                worksheet.write(r_idx, c_idx, cell_val, num_fmt)
+                            else:
+                                worksheet.write(r_idx, c_idx, cell_val, text_fmt)
+                    
+                    # 设置列宽
+                    worksheet.set_column(0, len(df.columns)-1, 12)
+
+                st.download_button(
+                    label="📥 下载“原样表头”纯数字 Excel",
+                    data=output.getvalue(),
+                    file_name="建议书原样提取.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
 
     except Exception as e:
-        st.error(f"⚠️ 处理出错：{str(e)}")
+        st.error(f"⚠️ 运行出错：{str(e)}")
