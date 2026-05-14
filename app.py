@@ -4,21 +4,19 @@ import pandas as pd
 import io
 import re
 
-# 1. 页面配置
-st.set_page_config(page_title="平安建议书提取神器", layout="wide")
-st.title("🖨️ 平安建议书表格“复印级”提取 V5.3")
-st.info("核心改进：逻辑合并跨页长表 | 保持嵌套表头合并 | 网页实时预览 | 纯数字转换")
+st.set_page_config(page_title="平安建议书提取神器 V5.4", layout="wide")
+st.title("🖨️ 平安建议书表格“复印级”提取 V5.4")
+st.info("核心改进：彻底修复 Index 报错 | 模糊匹配表头起始 | 跨页自动无缝拼接 | 纯数字转换")
 
-# 强力数字清洗
-def force_num(val):
-    if val is None or str(val).strip() == "" or str(val).lower() == "none":
-        return 0
+# 强力数字转换，解决绿三角
+def clean_to_number(val):
+    if val is None or str(val).strip() == "": return ""
+    # 移除换行、空格、逗号
     s = str(val).replace('\n', '').replace(' ', '').replace(',', '').strip()
-    # 只要包含数字且不含大量汉字，就尝试转码
-    if re.search(r'\d', s) and len(re.findall(r'[\u4e00-\u9fa5]', s)) < 2:
-        res = re.sub(r'[^-0-9.]', '', s)
+    # 匹配纯数字/小数点
+    if re.fullmatch(r'^-?[0-9.]+$', s):
         try:
-            return float(res) if '.' in res else int(res)
+            return float(s) if '.' in s else int(s)
         except: return s
     return s
 
@@ -26,9 +24,9 @@ uploaded_file = st.file_uploader("👉 请上传平安建议书 PDF 原件", typ
 
 if uploaded_file:
     try:
-        with st.spinner('⌛ 正在深度扫描并执行逻辑拼接...'):
+        with st.spinner('⌛ 正在像素级扫描全书并执行逻辑对齐...'):
             output = io.BytesIO()
-            all_page_previews = [] # 用于网页预览
+            all_previews = [] 
             
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 workbook = writer.book
@@ -38,66 +36,67 @@ if uploaded_file:
                 with pdfplumber.open(uploaded_file) as pdf:
                     current_ws = None
                     current_row_offset = 0
-                    scheme_count = 0
+                    sheet_idx = 0
                     
-                    # 遍历全书
                     for page_idx, page in enumerate(pdf.pages):
                         tables = page.find_tables()
                         if not tables: continue
                         
-                        # 网页预览存一份原始数据
-                        raw_data = page.extract_table()
-                        if raw_data:
-                            all_page_previews.append((f"第{page_idx+1}页", pd.DataFrame(raw_data)))
+                        # 每一页的原始数据先存预览
+                        page_raw = page.extract_table()
+                        if page_raw:
+                            all_previews.append((f"第{page_idx+1}页", pd.DataFrame(page_raw)))
 
                         for t_obj in tables:
                             data = t_obj.extract()
-                            if not data: continue
+                            # 防崩检查 1：如果表格没内容，直接跳过
+                            if not data or len(data) == 0: continue
                             
-                            # --- 判定新表起始：检查第一行是否包含“保单年度” ---
-                            first_row_str = "".join([str(c) for c in data[0] if c])
+                            # --- 逻辑判定：是否为新表起始 ---
+                            # 扫描前两行，寻找关键字
+                            is_new_sheet = False
+                            for r_check in range(min(2, len(data))):
+                                row_str = "".join([str(c) for c in data[r_check] if c])
+                                if "保单年度" in row_str or "年度" in row_str:
+                                    is_new_sheet = True
+                                    break
                             
-                            if "保单年度" in first_row_str:
-                                # 发现新方案：新建 Sheet
-                                scheme_count += 1
-                                current_ws = workbook.add_worksheet(f"方案_{scheme_count}")
+                            if is_new_sheet:
+                                sheet_idx += 1
+                                current_ws = workbook.add_worksheet(f"方案_{sheet_idx}")
                                 current_row_offset = 0
-                                # 记录这一张大表的起始列定义，用于后续续表对齐（可选）
                             
+                            # 只要有正在操作的 Sheet，就开始写入
                             if current_ws:
-                                # 确定数据起始行（用于区分表头和数字）
-                                data_start_idx = 0
+                                # 定位该表的数据起始行（第一列是数字的行）
+                                data_start_row = 0
                                 for r_idx, row in enumerate(data):
-                                    if str(row[0]).strip().isdigit():
-                                        data_start_idx = r_idx
+                                    if row and str(row[0]).strip().isdigit():
+                                        data_start_row = r_idx
                                         break
                                 
-                                # 识别并写入单元格逻辑
                                 written_mark = set()
+                                # 复刻合并单元格结构
                                 for cell in t_obj.cells:
-                                    r0, c0, r1, c1 = [int(x) for x in cell[:4]]
-                                    
-                                    # 如果是续表（当前页不包含“保单年度”），跳过重复的表头行
-                                    if "保单年度" not in first_row_str and r0 < data_start_idx:
-                                        continue
-                                    
-                                    # 计算在 Excel 中的实际行位置
-                                    if "保单年度" not in first_row_str:
-                                        # 续表需要减去表头偏移
-                                        actual_r0 = r0 - data_start_idx + current_row_offset
-                                        actual_r1 = r1 - data_start_idx + current_row_offset
-                                    else:
-                                        actual_r0 = r0 + current_row_offset
-                                        actual_r1 = r1 + current_row_offset
-                                    
-                                    # 获取内容
-                                    raw_text = data[r0][c0]
-                                    is_data_cell = (r0 >= data_start_idx)
-                                    val = force_num(raw_text) if is_data_cell else str(raw_text).replace('\n', ' ')
-                                    fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
-                                    
-                                    # 执行合并或写入
+                                    # 防崩检查 2：确保索引为整数且在范围内
                                     try:
+                                        r0, c0, r1, c1 = [int(x) for x in cell[:4]]
+                                        if r0 >= len(data) or c0 >= len(data[0]): continue
+                                        
+                                        # 如果是续表（当前页没搜到“年度”），跳过重复的表头
+                                        if not is_new_sheet and r0 < data_start_row:
+                                            continue
+                                        
+                                        # 计算长表中的垂直位置
+                                        actual_r0 = (r0 - data_start_row + current_row_offset) if not is_new_sheet else (r0 + current_row_offset)
+                                        actual_r1 = (r1 - data_start_row + current_row_offset) if not is_new_sheet else (r1 + current_row_offset)
+                                        
+                                        raw_text = data[r0][c0]
+                                        is_num_row = (r0 >= data_start_row)
+                                        val = clean_to_number(raw_text) if is_num_row else str(raw_text).replace('\n', ' ')
+                                        fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
+                                        
+                                        # 执行合并或写入
                                         if actual_r1 - actual_r0 > 1 or c1 - c0 > 1:
                                             current_ws.merge_range(actual_r0, c0, actual_r1 - 1, c1 - 1, val, fmt)
                                             for r_m in range(actual_r0, actual_r1):
@@ -106,33 +105,29 @@ if uploaded_file:
                                             current_ws.write(actual_r0, c0, val, fmt)
                                             written_mark.add((actual_r0, c0))
                                     except:
-                                        pass
+                                        continue
                                 
-                                # 更新下一页续表的行偏移
-                                if "保单年度" not in first_row_str:
-                                    current_row_offset += (len(data) - data_start_idx)
-                                else:
-                                    current_row_offset += len(data)
-                                
+                                # 更新偏移量
+                                current_row_offset += (len(data) - data_start_row) if not is_new_sheet else len(data)
                                 current_ws.set_column(0, 50, 12)
 
-            # --- 结果呈现 ---
-            st.success(f"🎉 处理完成！共识别到 {scheme_count} 组完整利益演示方案。")
+            # --- 结果展示 ---
+            st.success(f"🎉 扫描完成！共整合出 {sheet_idx} 份完整长表方案。")
             
-            # 网页预览（永不放弃模式）
-            for title, df in all_page_previews:
-                with st.expander(f"👁️ {title} 实时数据预览"):
+            # 网页预览预览区
+            for title, df in all_previews:
+                with st.expander(f"👁️ {title} 原始数据预览"):
                     st.dataframe(df, use_container_width=True)
             
-            if scheme_count > 0:
+            if sheet_idx > 0:
                 st.download_button(
-                    label="📥 下载“原样复刻”长表 Excel",
+                    label="📥 下载“长表拼接”纯数字 Excel",
                     data=output.getvalue(),
-                    file_name="平安建议书完整提取.xlsx",
+                    file_name="建议书提取_V5.4.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
-                st.warning("并未识别到以‘保单年度’开头的表格，请检查PDF页面。")
+                st.warning("并未识别到有效的利益演示表起始标记。")
 
     except Exception as e:
-        st.error(f"❌ 程序运行出错: {str(e)}")
+        st.error(f"❌ 运行遇到异常: {str(e)}")
