@@ -4,17 +4,14 @@ import pandas as pd
 import io
 import re
 
-# 1. 页面配置
-st.set_page_config(page_title="平安建议书复刻神器", layout="wide")
-st.title("🖨️ 平安建议书表格“复印级”提取 V2.3")
-st.info("已修复索引越界错误 | 完美还原合并单元格 | 强制数字格式化")
+st.set_page_config(page_title="平安建议书复刻工具 V3.0", layout="wide")
+st.title("🖨️ 平安建议书“复印级”提取 (按年度分组)")
+st.info("核心逻辑：按‘保单年度1’自动分表 + 完美还原合并单元格 + 纯数字无损转换")
 
-# 核心：纯净数字转换
 def clean_val(val):
     if val is None or str(val).strip() == "" or str(val).lower() == "none":
         return ""
     s = str(val).replace('\n', '').strip()
-    # 匹配数字、负号、逗号、小数点
     if re.fullmatch(r'^-?[0-9,.]+$', s):
         num_s = re.sub(r'[^-0-9.]', '', s)
         try:
@@ -26,80 +23,93 @@ uploaded_file = st.file_uploader("👉 请上传平安建议书 PDF 原件", typ
 
 if uploaded_file:
     try:
-        with st.spinner('⌛ 正在深度校准表格坐标与内容...'):
+        with st.spinner('⌛ 正在进行全量深度扫描与结构对齐...'):
             output = io.BytesIO()
-            all_previews = [] # 用于网页预览
-            
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 workbook = writer.book
-                # 定义 Excel 样式
                 num_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_name': '微软雅黑'})
                 text_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True, 'font_name': '微软雅黑'})
                 
                 with pdfplumber.open(uploaded_file) as pdf:
-                    # 扫描利益演示页（通常 10-25 页）
+                    all_sections = []
+                    current_section_cells = []
+                    current_row_offset = 0
+                    
+                    # 1. 深度遍历所有页面，提取所有单元格并处理“分表”逻辑
                     for page_idx in range(10, min(25, len(pdf.pages))):
                         page = pdf.pages[page_idx]
-                        # 查找页面上的所有表格
                         tables = page.find_tables()
                         if not tables: continue
                         
-                        for t_idx, table in enumerate(tables):
-                            # 每个表格一个独立 Sheet，或合并到一页（此处采用 Sheet 区分防止冲突）
-                            sheet_name = f"P{page_idx+1}_T{t_idx+1}"
-                            worksheet = workbook.add_worksheet(sheet_name[:31])
-                            
-                            # 直接获取该表格的数据矩阵
+                        for table in tables:
                             table_data = table.extract()
                             if not table_data: continue
                             
-                            # 存一份用于预览
-                            all_previews.append((sheet_name, pd.DataFrame(table_data)))
-                            
-                            # 记录已写入的合并区域，避免重复写入报错
-                            merged_cells = set()
-
-                            # 1. 先识别合并逻辑
-                            for cell in table.cells:
-                                # r0起行, c0起列, r1止行, c1止列
-                                r0, c0, r1, c1 = int(cell[0]), int(cell[1]), int(cell[2]), int(cell[3])
+                            # 检查该表是否开启了新的“保单年度 1”
+                            for r_idx, row_content in enumerate(table_data):
+                                first_col = str(row_content[0]).strip()
+                                # 如果在第一列发现数字 1，且当前已经有数据，则存入上一节
+                                if first_col == "1" and current_section_cells:
+                                    all_sections.append(current_section_cells)
+                                    current_section_cells = []
+                                    current_row_offset = 0
                                 
-                                # 安全获取文本
-                                try:
+                                # 将该行所有的单元格信息转换并存入当前节
+                                # 找到属于这一行的所有 cell
+                                cells_in_row = [c for c in table.cells if int(c[0]) == r_idx]
+                                for cell in cells_in_row:
+                                    r0, c0, r1, c1 = int(cell[0]), int(cell[1]), int(cell[2]), int(cell[3])
                                     raw_text = table_data[r0][c0]
-                                except IndexError: continue
-                                
-                                # 判断是否为数据行（第一列为数字）
-                                is_data = str(table_data[r0][0]).strip().isdigit()
-                                val = clean_val(raw_text) if is_data else str(raw_text).replace('\n', '')
+                                    # 如果是数据行（年度1-105），执行数字清洗
+                                    is_data = first_col.isdigit()
+                                    val = clean_val(raw_text) if is_data else str(raw_text).replace('\n', '')
+                                    
+                                    # 存储相对于当前 Sheet 起始位置的坐标
+                                    current_section_cells.append({
+                                        'r0': r0 + current_row_offset,
+                                        'c0': c0,
+                                        'r1': r1 + current_row_offset,
+                                        'c1': c1,
+                                        'val': val
+                                    })
+                            
+                            # 更新下一张表的行偏移量（保持在同一个 Sheet 里的连续性）
+                            current_row_offset += len(table_data)
+
+                    # 存入最后一节
+                    if current_section_cells:
+                        all_sections.append(current_section_cells)
+
+                    # 2. 将分组后的数据写入 Excel
+                    if not all_sections:
+                        st.error("未能在指定范围内识别到有效的利益演示表。")
+                    else:
+                        for idx, section in enumerate(all_sections):
+                            sheet_name = f"产品利益方案_{idx + 1}"
+                            worksheet = workbook.add_worksheet(sheet_name)
+                            written_mark = set()
+                            
+                            for item in section:
+                                r0, c0, r1, c1, val = item['r0'], item['c0'], item['r1'], item['c1'], item['val']
+                                fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
                                 
                                 if r1 - r0 > 1 or c1 - c0 > 1:
-                                    # 执行合并
-                                    fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
+                                    # 完美还原合并
                                     worksheet.merge_range(r0, c0, r1-1, c1-1, val, fmt)
-                                    # 标记已合并格子
                                     for r in range(r0, r1):
-                                        for c in range(c0, c1):
-                                            merged_cells.add((r, c))
+                                        for c in range(c0, c1): written_mark.add((r, c))
                                 else:
-                                    # 普通单元格（且未被合并覆盖）
-                                    if (r0, c0) not in merged_cells:
-                                        fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
+                                    if (r0, c0) not in written_mark:
                                         worksheet.write(r0, c0, val, fmt)
+                                        written_mark.add((r0, c0))
                             
                             worksheet.set_column(0, 30, 12)
 
-            st.success("🎉 数据重构完成！")
-            
-            # --- 网页展示预览 ---
-            for title, df in all_previews:
-                with st.expander(f"👁️ {title} 预览"):
-                    st.dataframe(df, use_container_width=True)
-            
+            st.success(f"🎉 复刻完成！共识别到 {len(all_sections)} 组产品利益演示。")
             st.download_button(
-                label="📥 下载“原样复印”Excel 文件",
+                label="📥 下载“年度分组”复印级 Excel",
                 data=output.getvalue(),
-                file_name="建议书表格提取_V2.3.xlsx",
+                file_name="平安建议书数据复刻_分组版.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
