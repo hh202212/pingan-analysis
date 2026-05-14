@@ -4,138 +4,110 @@ import pandas as pd
 import io
 import re
 
-st.set_page_config(page_title="平安建议书提取 V5.6", layout="wide")
-st.title("🖨️ 平安建议书表格“复印级”提取 V5.6")
-st.info("改进：修复浮点索引与越界错误 | 网页预览与下载完全同步 | 自动跨页长表缝合")
+# 1. 页面配置
+st.set_page_config(page_title="平安建议书提取 V5.7", layout="wide")
+st.title("🖨️ 平安建议书表格提取 V5.7 (稳定不留白版)")
+st.info("核心改进：预览与下载数据强对齐 | 彻底修复下载空表 | 自动跨页缝合长表")
 
-# 强制数字转换，彻底解决绿三角
-def clean_to_number(val):
-    if val is None or str(val).strip() == "": return ""
-    # 移除换行、空格、逗号、人民币符号
-    s = str(val).replace('\n', '').replace(' ', '').replace(',', '').replace('¥', '').strip()
-    if re.fullmatch(r'^-?[0-9.]+$', s):
+# 强制数字转换函数
+def force_num(val):
+    if val is None or str(val).strip() == "" or str(val).lower() == "none":
+        return ""
+    s = str(val).replace('\n', '').replace(' ', '').replace(',', '').strip()
+    # 匹配纯数字/小数点，且不含汉字
+    if re.fullmatch(r'^-?[0-9.]+$', s) and not re.search(r'[\u4e00-\u9fa5]', s):
         try:
             return float(s) if '.' in s else int(s)
         except: return s
-    return s
+    return str(val).replace('\n', ' ')
 
 uploaded_file = st.file_uploader("👉 请上传平安建议书 PDF 原件", type="pdf")
 
 if uploaded_file:
     try:
-        with st.spinner('⌛ 正在深度扫描并缝合长表，请稍候...'):
-            all_schemes = [] # 存储方案
-            current_scheme = {"data": [], "cells": [], "row_offset": 0}
+        with st.spinner('⌛ 正在深度缝合长表数据，请稍候...'):
+            all_schemes = [] # 存储最终的方案数据 (List of List)
+            current_scheme_rows = []
             
             with pdfplumber.open(uploaded_file) as pdf:
-                for page_idx, page in enumerate(pdf.pages):
-                    tables = page.find_tables()
-                    if not tables: continue
+                for page in pdf.pages:
+                    # 获取这一页最完整的表格矩阵
+                    table = page.extract_table()
+                    if not table: continue
                     
-                    for t_obj in tables:
-                        table_data = t_obj.extract()
-                        if not table_data or len(table_data) == 0: continue
-                        
-                        # 判定是否为新表起始
-                        is_new = False
-                        first_row_str = "".join([str(c) for c in table_data[0] if c])
-                        if "保单年度" in first_row_str or (table_data[0][0] and str(table_data[0][0]).strip() == "1"):
-                            is_new = True
-                        
-                        # 如果是新表，结算上一个方案
-                        if is_new and current_scheme["data"]:
-                            all_schemes.append(current_scheme)
-                            current_scheme = {"data": [], "cells": [], "row_offset": 0}
-                        
-                        # 定位数据行
-                        data_start = 0
-                        for r_idx, row in enumerate(table_data):
-                            if row and str(row[0]).strip().isdigit():
-                                data_start = r_idx
-                                break
-                        
-                        # 记录数据（用于预览）
-                        start_writing = 0 if (is_new or not current_scheme["data"]) else data_start
-                        for r_idx in range(start_writing, len(table_data)):
-                            current_scheme["data"].append(table_data[r_idx])
-                        
-                        # 记录单元格结构（用于 Excel 合并）
-                        for cell in t_obj.cells:
-                            # 强制转为整数，防止 float 索引报错
-                            try:
-                                r0, c0, r1, c1 = [int(round(x)) for x in cell[:4]]
-                                
-                                # 续表逻辑：跳过表头
-                                if not is_new and current_scheme["data"] and r0 < data_start:
-                                    continue
-                                
-                                # 坐标平移
-                                shift = current_scheme["row_offset"]
-                                act_r0 = r0 + shift if (is_new or shift == 0) else (r0 - data_start + shift)
-                                act_r1 = r1 + shift if (is_new or shift == 0) else (r1 - data_start + shift)
-                                
-                                # 越界保护
-                                if r0 >= len(table_data) or c0 >= len(table_data[0]): continue
-                                
-                                current_scheme["cells"].append({
-                                    'r0': act_r0, 'c0': c0, 'r1': act_r1, 'c1': c1,
-                                    'val': table_data[r0][c0], 
-                                    'is_num': (r0 >= data_start)
-                                })
-                            except: continue
-                        
-                        # 更新偏移量
-                        current_scheme["row_offset"] += (len(table_data) - start_writing)
+                    # --- 拼接逻辑判定 ---
+                    # 检查这一页的第一行或第二行是否包含“保单年度”
+                    is_new_scheme = False
+                    for r_idx in range(min(3, len(table))):
+                        row_str = "".join([str(c) for c in table[r_idx] if c])
+                        if "保单年度" in row_str:
+                            is_new_scheme = True
+                            break
+                    
+                    # 如果是新方案，保存上一个
+                    if is_new_scheme and current_scheme_rows:
+                        all_schemes.append(current_scheme_rows)
+                        current_scheme_rows = []
+                    
+                    # 定位数据行起始点
+                    data_start_idx = 0
+                    for r_idx, row in enumerate(table):
+                        if row and str(row[0]).strip().isdigit():
+                            data_start_idx = r_idx
+                            break
+                    
+                    # 如果是续表（不是新方案），则跳过表头行
+                    rows_to_add = table if (is_new_scheme or not current_scheme_rows) else table[data_start_idx:]
+                    
+                    for r in rows_to_add:
+                        # 每一格都做基础清洗
+                        clean_row = [force_num(cell) for cell in r]
+                        current_scheme_rows.append(clean_row)
 
-                if current_scheme["data"]:
-                    all_schemes.append(current_scheme)
+                # 存入最后一个方案
+                if current_scheme_rows:
+                    all_schemes.append(current_scheme_rows)
 
-            # --- 渲染区 ---
+            # --- 结果呈现区 ---
             if not all_schemes:
-                st.warning("⚠️ 未能识别到有效的利益演示表。")
+                st.warning("⚠️ 未能识别到有效的利益演示表数据。")
             else:
-                st.success(f"🎉 成功缝合 {len(all_schemes)} 组方案！")
+                st.success(f"🎉 成功缝合 {len(all_schemes)} 组长表方案！")
                 
-                # 1. 网页预览 (显示缝合后的结果)
-                for idx, scheme in enumerate(all_schemes):
-                    with st.expander(f"👁️ 方案 {idx+1} 预览 (已自动合并跨页数据)"):
-                        st.dataframe(pd.DataFrame(scheme['data']), use_container_width=True)
+                # 1. 网页预览 (胡老师要求的预览模式，必须显示拼接后的长表)
+                for idx, scheme_data in enumerate(all_schemes):
+                    df_preview = pd.DataFrame(scheme_data)
+                    with st.expander(f"👁️ 方案 {idx+1} 预览 (已自动无缝拼接，共 {len(df_preview)} 行)"):
+                        st.dataframe(df_preview, use_container_width=True)
                 
-                # 2. 生成 Excel
+                # 2. 生成 Excel (采用最稳的逻辑，确保不留白)
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     workbook = writer.book
-                    num_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_name': '微软雅黑'})
-                    text_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True, 'font_name': '微软雅黑'})
+                    num_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center', 'valign': 'vcenter', 'border': 1})
+                    text_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True})
                     
-                    for idx, scheme in enumerate(all_schemes):
-                        ws = workbook.add_worksheet(f"方案_{idx+1}")
-                        written_cells = set()
+                    for idx, scheme_data in enumerate(all_schemes):
+                        sheet_name = f"方案_{idx+1}"
+                        # 写入 Excel
+                        df_final = pd.DataFrame(scheme_data)
+                        df_final.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
                         
-                        # 排序：先写合并单元格，再写普通单元格
-                        for c in sorted(scheme['cells'], key=lambda x: (x['r1']-x['r0']), reverse=True):
-                            r0, c0, r1, c1, raw_val, is_num = c['r0'], c['c0'], c['r1'], c['c1'], c['val'], c['is_num']
-                            val = clean_to_number(raw_val) if is_num else str(raw_val).replace('\n', ' ')
-                            fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
-                            
-                            try:
-                                if r1 - r0 > 1 or c1 - c0 > 1:
-                                    ws.merge_range(r0, c0, r1-1, c1-1, val, fmt)
-                                    for r in range(r0, r1):
-                                        for col in range(c0, c1): written_cells.add((r, col))
-                                elif (r0, c0) not in written_cells:
-                                    ws.write(r0, c0, val, fmt)
-                                    written_cells.add((r0, c0))
-                            except: pass
+                        # 获取 worksheet 对象进行样式微调
+                        ws = writer.sheets[sheet_name]
+                        for r_idx, row in enumerate(scheme_data):
+                            for c_idx, val in enumerate(row):
+                                fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
+                                ws.write(r_idx, c_idx, val, fmt)
+                        
                         ws.set_column(0, 50, 15)
 
                 st.download_button(
-                    label="📥 点击下载“复印级”长表 Excel",
+                    label="📥 点击下载“缝合版”纯数字 Excel (确保有数)",
                     data=output.getvalue(),
-                    file_name="平安建议书提取_V5.6.xlsx",
+                    file_name="平安建议书提取_V5.7.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
     except Exception as e:
-        st.error(f"❌ 程序运行崩溃: {str(e)}")
-        st.info("提示：这通常是因为 PDF 内部结构极度复杂。请尝试重新下载 PDF 电子版后再试。")
+        st.error(f"❌ 运行异常: {str(e)}")
