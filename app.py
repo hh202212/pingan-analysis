@@ -4,17 +4,14 @@ import pandas as pd
 import io
 import re
 
-# 1. 页面配置
-st.set_page_config(page_title="平安建议书提取神器", layout="wide")
-st.title("🛡️ 平安建议书数据提取 (稳健回归版 V3.6)")
-st.info("说明：此版本优先保证“数据不漏”和“数字格式正确”。遇到新的‘保单年度 1’会自动分表。")
+st.set_page_config(page_title="平安建议书复刻神器", layout="wide")
+st.title("🖨️ 平安建议书“复印级”提取 (V3.7 逻辑对齐版)")
+st.info("核心逻辑：识别左上角‘保单年度’作为整表起始 | 自动关联表头与内容 | 纯数字无损转换")
 
-# 辅助函数：强力转数字
-def to_num(val):
+def clean_val(val):
     if val is None or str(val).strip() == "" or str(val).lower() == "none":
         return ""
     s = str(val).replace('\n', '').replace(' ', '').strip()
-    # 匹配数字格式
     if re.fullmatch(r'^-?[0-9,.]+$', s):
         num_s = re.sub(r'[^-0-9.]', '', s)
         try:
@@ -26,91 +23,85 @@ uploaded_file = st.file_uploader("👉 请上传平安建议书 PDF 原件", typ
 
 if uploaded_file:
     try:
-        with st.spinner('🔍 正在全书扫描“利益演示表”并校准数据...'):
-            all_pages_data = []
-            with pdfplumber.open(uploaded_file) as pdf:
-                found_target = False
-                for i, page in enumerate(pdf.pages):
-                    text = page.extract_text() or ""
-                    # 锚点识别：发现“利益演示表”才开始抓取
-                    if "利益演示表" in text:
-                        found_target = True
+        with st.spinner('⌛ 正在识别表格逻辑结构，请稍候...'):
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                workbook = writer.book
+                num_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_name': '微软雅黑'})
+                text_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True, 'font_name': '微软雅黑'})
+                
+                with pdfplumber.open(uploaded_file) as pdf:
+                    current_worksheet = None
+                    current_row_offset = 0
+                    table_count = 0
                     
-                    if found_target:
-                        table = page.extract_table()
-                        if table:
-                            all_pages_data.append(table)
+                    # 遍历全书，寻找利益演示表
+                    for page_idx, page in enumerate(pdf.pages):
+                        tables = page.find_tables()
+                        if not tables: continue
                         
-                        # 遇到声明或提醒，通常意味着这一段利益表结束了
-                        if "特别提醒" in text or "重要提示" in text:
-                            # 这里不停止，继续往后看有没有附加险的利益表
-                            pass
-            
-            if not all_pages_data:
-                st.warning("⚠️ 未能定位到利益演示表，请确认 PDF 是否包含该关键字。")
-            else:
-                # --- 核心逻辑：按“保单年度 1”进行分组 ---
-                sections = []
-                current_section = []
-                
-                for table in all_pages_data:
-                    for row in table:
-                        # 检查第一列是否是新的“保单年度 1”
-                        first_col = str(row[0]).strip() if row[0] else ""
-                        # 兼容处理：有些合并格子里是 "保单年度\n1"
-                        if (first_col == "1" or "年度1" in first_col.replace('\n','')) and current_section:
-                            # 只有当当前 section 里已经有数据行时，才切分（避免把表头切断）
-                            # 我们简单判断：如果当前 section 最后几行里有数字，就切分
-                            sections.append(current_section)
-                            current_section = []
-                        current_section.append(row)
-                
-                if current_section:
-                    sections.append(current_section)
-
-                # --- 写入 Excel ---
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    workbook = writer.book
-                    num_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center', 'valign': 'vcenter', 'border': 1})
-                    text_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True})
-
-                    for idx, section in enumerate(sections):
-                        df = pd.DataFrame(section)
-                        sheet_name = f"方案_{idx+1}"
-                        worksheet = workbook.add_worksheet(sheet_name)
-                        
-                        for r_idx, row in df.iterrows():
-                            # 判断是否为数据行（第一列包含数字）
-                            is_data = False
-                            if re.search(r'\d', str(row[0])):
-                                is_data = True
+                        for table_obj in tables:
+                            table_data = table_obj.extract()
+                            if not table_data: continue
                             
-                            for c_idx, cell_val in enumerate(row):
-                                val = to_num(cell_val) if is_data else str(cell_val).replace('\n', ' ')
+                            # --- 关键判定：左上角第一个单元格是否包含“保单年度” ---
+                            top_left_cell = str(table_data[0][0]).replace('\n', '').strip()
+                            
+                            if "保单年度" in top_left_cell:
+                                # 发现新表起始：新建一个子表 (Sheet)
+                                table_count += 1
+                                sheet_name = f"利益演示方案_{table_count}"
+                                current_worksheet = workbook.add_worksheet(sheet_name[:31])
+                                current_row_offset = 0 # 重置行偏移量
+                            
+                            # 如果已经确定了当前的操作子表，则开始写入内容
+                            if current_worksheet:
+                                written_mark = set()
+                                # 物理还原合并单元格结构
+                                for cell in table_obj.cells:
+                                    r0, c0, r1, c1 = int(cell[0]), int(cell[1]), int(cell[2]), int(cell[3])
+                                    
+                                    try:
+                                        raw_text = table_data[r0][c0]
+                                    except IndexError: continue
+                                    
+                                    # 判定是否为数据行（第一列是数字，或者是合并格子里的数字1）
+                                    first_col_val = str(table_data[r0][0]).strip()
+                                    is_data_row = any(char.isdigit() for char in first_col_val) and "保单年度" not in first_col_val
+                                    
+                                    val = clean_val(raw_text) if is_data_row else str(raw_text).replace('\n', ' ')
+                                    fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
+                                    
+                                    # 写入 Excel，注意要加上 current_row_offset 实现跨页连表
+                                    ex_r0, ex_r1 = r0 + current_row_offset, r1 + current_row_offset
+                                    
+                                    if ex_r1 - ex_r0 > 1 or c1 - c0 > 1:
+                                        # 合并写入
+                                        try:
+                                            current_worksheet.merge_range(ex_r0, c0, ex_r1 - 1, c1 - 1, val, fmt)
+                                        except: pass # 防止重叠报错
+                                        for r in range(ex_r0, ex_r1):
+                                            for c in range(c0, c1): written_mark.add((r, c))
+                                    else:
+                                        # 普通写入
+                                        if (ex_r0, c0) not in written_mark:
+                                            current_worksheet.write(ex_r0, c0, val, fmt)
+                                            written_mark.add((ex_r0, c0))
                                 
-                                # 写入
-                                if isinstance(val, (int, float)):
-                                    worksheet.write(r_idx, c_idx, val, num_fmt)
-                                else:
-                                    worksheet.write(r_idx, c_idx, val, text_fmt)
-                        
-                        worksheet.set_column(0, 30, 12)
+                                # 更新下一张续表的起始位置
+                                current_row_offset += len(table_data)
+                                current_worksheet.set_column(0, 30, 12)
 
-                st.success(f"🎉 提取成功！共识别到 {len(sections)} 组产品利益。")
-                
-                # 网页预览预览
-                with st.expander("👁️ 点击预览提取到的数据"):
-                    for i, s in enumerate(sections):
-                        st.write(f"方案 {i+1}")
-                        st.table(pd.DataFrame(s).head(10)) # 只显示前10行预览
-
+            if table_count == 0:
+                st.warning("⚠️ 未能识别到以‘保单年度’开头的利益表，请检查PDF内容。")
+            else:
+                st.success(f"🎉 提取成功！已为您整合了 {table_count} 张完整的利益演示表。")
                 st.download_button(
-                    label="📥 下载纯数字版 Excel",
+                    label="📥 下载“逻辑对齐”Excel 文件",
                     data=output.getvalue(),
-                    file_name="平安提取结果_稳健版.xlsx",
+                    file_name="平安建议书完整复刻.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
     except Exception as e:
-        st.error(f"⚠️ 运行出错：{str(e)}")
+        st.error(f"⚠️ 处理出错：{str(e)}")
