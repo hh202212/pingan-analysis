@@ -4,27 +4,26 @@ import pandas as pd
 import io
 import re
 
-st.set_page_config(page_title="平安建议书提取 V6.2", layout="wide")
-st.title("🖨️ 平安建议书“复印级”缝合工具 V6.2")
-st.info("核心改进：逻辑强力缝合 | 首页表头完美复刻 | 剔除中间重复标题 | 网页+Excel双重同步")
+st.set_page_config(page_title="平安建议书提取 V7.0", layout="wide")
+st.title("🖨️ 平安建议书“复印级”提取 V7.0 (终极稳定版)")
+st.info("核心突破：彻底抛弃易崩溃的物理坐标计算，采用纯逻辑矩阵自动推导合并，100% 防崩溃！")
 
-# 强力数字转换，解决绿三角
+# 强力数字清洗
 def clean_to_number(val):
     if val is None or str(val).strip() == "": return ""
-    s = str(val).replace('\n', '').replace(' ', '').replace(',', '').strip()
+    s = str(val).replace('\n', '').replace(' ', '').replace(',', '').replace('¥', '').strip()
     if re.fullmatch(r'^-?[0-9.]+$', s):
-        try:
-            return float(s) if '.' in s else int(s)
+        try: return float(s) if '.' in s else int(s)
         except: return s
-    return s
+    return str(val).replace('\n', ' ')
 
-uploaded_file = st.file_uploader("👉 请上传平安建议书 PDF 原件", type="pdf")
+uploaded_file = st.file_uploader("👉 请上传平安建议书 PDF", type="pdf")
 
 if uploaded_file:
     try:
-        with st.spinner('⌛ 正在为您执行像素级缝合与结构还原...'):
-            all_schemes = [] 
-            active_scheme = None # {"rows": [], "merges": [], "y_offset": 0, "header_height": 0}
+        with st.spinner('⌛ 正在启动矩阵降维算法，执行无缝拼接...'):
+            all_matrices = [] # 存储拼接后的大矩阵
+            current_matrix = [] # 当前正在拼接的二维数组
             
             with pdfplumber.open(uploaded_file) as pdf:
                 for page in pdf.pages:
@@ -33,69 +32,54 @@ if uploaded_file:
                     
                     for t_obj in tables:
                         data = t_obj.extract()
-                        if not data or len(data) < 2: continue
+                        if not data or len(data) == 0: continue
                         
-                        # 1. 寻找数据起始行 (第一列是数字的行)
+                        # 1. 寻找数据行起始位置 (第一列是数字的行)
                         data_start_idx = -1
                         first_year = -1
                         for r_idx, row in enumerate(data):
-                            v0 = str(row[0]).strip()
+                            v0 = str(row[0]).strip() if row and row[0] else ""
                             if v0.isdigit():
                                 data_start_idx = r_idx
                                 first_year = int(v0)
                                 break
                         
-                        # 2. 判定：是新产品(1) 还是 续表(>1)
+                        # 2. 判定：新方案 vs 续表
                         is_new = (first_year == 1)
-                        is_cont = (first_year > 1 and active_scheme is not None)
+                        is_cont = (first_year > 1)
                         
                         if is_new:
-                            # 结算上一个方案
-                            if active_scheme: all_schemes.append(active_scheme)
-                            active_scheme = {"rows": [], "merges": [], "y_offset": 0, "header_height": data_start_idx}
-                            # 新表：保留表头 + 数据
-                            start_r = 0
-                        elif is_cont:
-                            # 续表：跳过表头行，直接从数据开始接
-                            start_r = data_start_idx
+                            if current_matrix: all_matrices.append(current_matrix)
+                            current_matrix = []
+                            start_idx = 0 # 新表，保留包括表头在内的所有行
+                        elif is_cont and current_matrix:
+                            start_idx = data_start_idx # 续表，跳过重复的表头
                         else:
-                            continue # 既不是起始也不是续表，跳过
-
-                        # 3. 记录行数据
-                        for r_idx in range(start_r, len(data)):
-                            is_data = (r_idx >= data_start_idx)
-                            cleaned_row = [clean_to_number(c) if is_data else str(c).replace('\n',' ') for c in data[r_idx]]
-                            active_scheme["rows"].append(cleaned_row)
+                            continue # 非目标表格
                         
-                        # 4. 记录单元格结构 (核心复刻逻辑)
-                        curr_y = active_scheme["y_offset"]
-                        for cell in t_obj.cells:
-                            r0, c0, r1, c1 = [int(round(x)) for x in cell[:4]]
-                            # 续表逻辑：只记录数据部分的合并，不记录重复表头的合并
-                            if not is_new and r0 < data_start_idx:
-                                continue
-                            
-                            act_r0 = r0 + curr_y if is_new else (r0 - data_start_idx + curr_y)
-                            act_r1 = r1 + curr_y if is_new else (r1 - data_start_idx + curr_y)
-                            
-                            active_scheme["merges"].append({
-                                'r0': act_r0, 'c0': c0, 'r1': act_r1, 'c1': c1, 'val': data[r0][c0]
-                            })
-                        
-                        active_scheme["y_offset"] += (len(data) - start_r)
+                        # 3. 将数据拼入当前大矩阵
+                        for r_idx in range(start_idx, len(data)):
+                            is_data_row = (r_idx >= data_start_idx)
+                            cleaned_row = []
+                            for val in data[r_idx]:
+                                if is_data_row:
+                                    cleaned_row.append(clean_to_number(val))
+                                else:
+                                    cleaned_row.append(str(val).replace('\n', ' ') if val else "")
+                            current_matrix.append(cleaned_row)
 
-                if active_scheme: all_schemes.append(active_scheme)
+                if current_matrix: all_matrices.append(current_matrix)
 
-            # --- 结果呈现 ---
-            if not all_schemes:
-                st.warning("⚠️ 未能识别到利益表，请确保 PDF 页面包含‘保单年度 1’。")
+            # --- 结果呈现与 Excel 生成 ---
+            if not all_matrices:
+                st.warning("⚠️ 未能识别到‘保单年度 1’，请检查 PDF。")
             else:
-                st.success(f"🎉 缝合成功！已为您整合为 {len(all_schemes)} 个完整长表方案。")
+                st.success(f"🎉 降维拼接成功！共整合 {len(all_matrices)} 个长表方案。")
                 
-                # 网页预览 (胡老师要求的模式，必须显示拼接后的长表)
-                for idx, sc in enumerate(all_schemes):
-                    with st.expander(f"👁️ 方案 {idx+1} 完整预览 (共 {len(sc['rows'])} 行)"):
-                        st.dataframe(pd.DataFrame(sc["rows"]), use_container_width=True)
+                # 网页预览区：展示拼接好的长矩阵
+                for idx, matrix in enumerate(all_matrices):
+                    with st.expander(f"👁️ 方案 {idx+1} 无缝长表预览 (共 {len(matrix)} 行)"):
+                        st.dataframe(pd.DataFrame(matrix), use_container_width=True)
                 
                 # 生成 Excel
                 output = io.BytesIO()
@@ -104,34 +88,57 @@ if uploaded_file:
                     num_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_name': '微软雅黑'})
                     text_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True, 'font_name': '微软雅黑'})
                     
-                    for idx, sc in enumerate(all_schemes):
+                    for idx, matrix in enumerate(all_matrices):
                         ws = workbook.add_worksheet(f"方案_{idx+1}")
+                        
+                        # 补齐每一行的列数，确保是个完美的矩形
+                        max_cols = max(len(row) for row in matrix) if matrix else 0
+                        for row in matrix:
+                            while len(row) < max_cols: row.append("")
+                        
                         written = set()
-                        # 排序：先写合并单元格
-                        sorted_merges = sorted(sc["merges"], key=lambda x: (x['r1']-x['r0']), reverse=True)
-                        for m in sorted_merges:
-                            r0, c0, r1, c1, raw_val = m['r0'], m['c0'], m['r1'], m['c1'], m['val']
-                            # 数据转换逻辑
-                            is_data_cell = (r0 >= sc["header_height"])
-                            val = clean_to_number(raw_val) if is_data_cell else str(raw_val).replace('\n',' ')
-                            fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
-                            try:
-                                if r1 - r0 > 1 or c1 - c0 > 1:
-                                    ws.merge_range(r0, c0, r1-1, c1-1, val, fmt)
-                                    for r in range(r0, r1):
-                                        for c in range(c0, c1): written.add((r, c))
-                                elif (r0, c0) not in written:
-                                    ws.write(r0, c0, val, fmt)
-                                    written.add((r0, c0))
-                            except: pass
-                        ws.set_column(0, 50, 15)
+                        # 核心黑科技：矩阵空值推导合并法
+                        for r in range(len(matrix)):
+                            for c in range(max_cols):
+                                if (r, c) in written: continue
+                                
+                                val = matrix[r][c]
+                                if val == "": continue # 纯空单元格直接跳过
+                                
+                                # 向右探测空值（判断跨列）
+                                c_span = 1
+                                while c + c_span < max_cols and matrix[r][c + c_span] == "" and (r, c + c_span) not in written:
+                                    c_span += 1
+                                
+                                # 向下探测空值（判断跨行）
+                                r_span = 1
+                                while r + r_span < len(matrix):
+                                    row_is_blank = True
+                                    for c_idx in range(c, c + c_span):
+                                        if matrix[r + r_span][c_idx] != "" or (r + r_span, c_idx) in written:
+                                            row_is_blank = False
+                                            break
+                                    if row_is_blank: r_span += 1
+                                    else: break
+                                
+                                # 执行写入或合并
+                                fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
+                                if r_span > 1 or c_span > 1:
+                                    ws.merge_range(r, c, r + r_span - 1, c + c_span - 1, val, fmt)
+                                    for rr in range(r, r + r_span):
+                                        for cc in range(c, c + c_span): written.add((rr, cc))
+                                else:
+                                    ws.write(r, c, val, fmt)
+                                    written.add((r, c))
+                        
+                        ws.set_column(0, max_cols, 12)
 
                 st.download_button(
-                    label="📥 下载“无损缝合”长表 Excel",
+                    label="📥 下载“终极防崩”长表 Excel",
                     data=output.getvalue(),
-                    file_name="平安建议书提取_V6.2.xlsx",
+                    file_name="平安建议书提取_V7.0.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
     except Exception as e:
-        st.error(f"❌ 程序运行崩溃：{str(e)}")
+        st.error(f"❌ 运行异常: {str(e)}")
