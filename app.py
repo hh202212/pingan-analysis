@@ -4,13 +4,15 @@ import pandas as pd
 import io
 import re
 
-st.set_page_config(page_title="平安建议书提取 V5.8", layout="wide")
-st.title("🖨️ 平安建议书“复印级”提取 V5.8 (全量缝合版)")
-st.info("核心：跨页逻辑无缝缝合 | 还原嵌套合并表头 | 网页预览=Excel下载 | 纯数字转换")
+# 1. 页面配置
+st.set_page_config(page_title="平安建议书提取 V5.9", layout="wide")
+st.title("🖨️ 平安建议书表格“复印级”提取 V5.9")
+st.info("核心改进：逻辑防崩溃机制 | 真正的全量长表缝合 | 仅保留首个复印级表头 | 强力数字清洗")
 
+# 强制数字清洗函数
 def clean_num(val):
     if val is None or str(val).strip() == "" or str(val).lower() == "none":
-        return ""
+        return 0
     s = str(val).replace('\n', '').replace(' ', '').replace(',', '').strip()
     if re.fullmatch(r'^-?[0-9.]+$', s) and not re.search(r'[\u4e00-\u9fa5]', s):
         try:
@@ -22,9 +24,9 @@ uploaded_file = st.file_uploader("👉 请上传平安建议书 PDF", type="pdf"
 
 if uploaded_file:
     try:
-        with st.spinner('⌛ 正在像素级缝合长表数据，请稍候...'):
-            all_schemes = [] # 存储结构：{"rows": [], "merges": [], "row_offset": 0}
-            active_scheme = None
+        with st.spinner('⌛ 正在为您执行“像素级”缝合与结构还原...'):
+            schemes = [] # 存储最终结果：{"header_merges": [], "header_rows": [], "data_rows": []}
+            current_scheme = None
             
             with pdfplumber.open(uploaded_file) as pdf:
                 for page in pdf.pages:
@@ -33,108 +35,103 @@ if uploaded_file:
                     
                     for t_obj in tables:
                         data = t_obj.extract()
-                        if not data or len(data) == 0: continue
+                        # 防崩溃：数据为空或行数不足直接跳过
+                        if not data or len(data) < 1: continue
                         
-                        # 1. 寻找数据起始行和起始年度
+                        # 识别数据行起始 (第一列是数字的行)
                         data_start_idx = -1
                         first_year = -1
                         for r_idx, row in enumerate(data):
-                            val0 = str(row[0]).strip()
-                            if val0.isdigit():
+                            if row and str(row[0]).strip().isdigit():
                                 data_start_idx = r_idx
-                                first_year = int(val0)
+                                first_year = int(str(row[0]).strip())
                                 break
                         
-                        # 2. 判定：是新方案起始(1)，还是老方案续接(>1)
+                        # 判断逻辑：新方案 vs 续表
                         is_new = (first_year == 1)
-                        is_cont = (first_year > 1)
                         
                         if is_new:
-                            if active_scheme: all_schemes.append(active_scheme)
-                            active_scheme = {"rows": [], "merges": [], "row_offset": 0}
-                        
-                        if active_scheme is not None:
-                            # 3. 记录行数据用于预览和Excel基础写入
-                            start_from = 0 if is_new else data_start_idx
-                            if data_start_idx == -1: start_from = 0 # 兜底
-                            
-                            for r_idx in range(start_from, len(data)):
-                                # 清洗这一行的数据
-                                cleaned_row = [clean_num(c) for c in data[r_idx]]
-                                active_scheme["rows"].append(cleaned_row)
-                            
-                            # 4. 记录合并单元格结构用于Excel“复印”
+                            # 结算上一个方案
+                            if current_scheme: schemes.append(current_scheme)
+                            # 初始化新方案
+                            current_scheme = {
+                                "header_rows": data[:data_start_idx] if data_start_idx != -1 else [],
+                                "header_merges": [],
+                                "data_rows": [],
+                                "header_height": data_start_idx if data_start_idx != -1 else 0
+                            }
+                            # 记录“复印级”合并表头结构
                             for cell in t_obj.cells:
                                 r0, c0, r1, c1 = [int(round(x)) for x in cell[:4]]
-                                # 续表逻辑：跳过重复表头
-                                if is_cont and r0 < data_start_idx: continue
-                                
-                                # 计算相对于长表的全局行坐标
-                                shift = active_scheme["row_offset"]
-                                act_r0 = r0 + shift if is_new else (r0 - data_start_idx + shift)
-                                act_r1 = r1 + shift if is_new else (r1 - data_start_idx + shift)
-                                
-                                active_scheme["merges"].append({
-                                    'r0': act_r0, 'c0': c0, 'r1': act_r1, 'c1': c1,
-                                    'val': clean_num(data[r0][c0])
-                                })
-                            
-                            # 更新方案的总行数偏移量
-                            active_scheme["row_offset"] += (len(data) - start_from)
+                                if r0 < current_scheme["header_height"]:
+                                    current_scheme["header_merges"].append({
+                                        'r0': r0, 'c0': c0, 'r1': r1, 'c1': c1, 'val': data[r0][c0]
+                                    })
+                        
+                        # 只要有正在操作的方案，就往里塞数据行
+                        if current_scheme is not None:
+                            # 如果没找到数据起始，可能整页都是标题或垃圾，跳过
+                            if data_start_idx != -1:
+                                for r_idx in range(data_start_idx, len(data)):
+                                    cleaned_row = [clean_num(c) for c in data[r_idx]]
+                                    current_scheme["data_rows"].append(cleaned_row)
 
-                if active_scheme: all_schemes.append(active_scheme)
+                if current_scheme: schemes.append(current_scheme)
 
-            # --- 结果呈现 ---
-            if not all_schemes:
-                st.warning("⚠️ 未识别到有效利益表。")
+            # --- 渲染区 ---
+            if not schemes:
+                st.warning("⚠️ 未能识别到有效的利益演示表起始标记（保单年度 1）。")
             else:
-                st.success(f"🎉 缝合成功！已整合 {len(all_schemes)} 份长表方案。")
+                st.success(f"🎉 缝合成功！已为您处理 {len(schemes)} 份完整利益方案。")
                 
-                # 网页预览预览区
-                for idx, scheme in enumerate(all_schemes):
-                    with st.expander(f"👁️ 方案 {idx+1} 预览 (已无缝拼接 {len(scheme['rows'])} 行)"):
-                        st.dataframe(pd.DataFrame(scheme['rows']), use_container_width=True)
+                # 1. 网页预览 (将表头和数据拼接展示)
+                for idx, sc in enumerate(schemes):
+                    full_table = sc["header_rows"] + sc["data_rows"]
+                    with st.expander(f"👁️ 方案 {idx+1} 预览 (已无缝缝合 {len(full_table)} 行数据)"):
+                        st.dataframe(pd.DataFrame(full_table), use_container_width=True)
                 
-                # 生成 Excel
+                # 2. 生成 Excel
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     workbook = writer.book
                     num_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_name': '微软雅黑'})
                     text_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True, 'font_name': '微软雅黑'})
                     
-                    for idx, scheme in enumerate(all_schemes):
+                    for idx, sc in enumerate(schemes):
                         ws = workbook.add_worksheet(f"方案_{idx+1}")
-                        written_set = set()
+                        written_cells = set()
                         
-                        # 先根据 merges 记录执行“复印级”合并
-                        for m in scheme["merges"]:
+                        # A. 写入复印级表头 (带合并单元格)
+                        for m in sc["header_merges"]:
                             r0, c0, r1, c1, val = m['r0'], m['c0'], m['r1'], m['c1'], m['val']
-                            fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
+                            fmt = text_fmt
                             try:
                                 if r1 - r0 > 1 or c1 - c0 > 1:
-                                    ws.merge_range(r0, c0, r1-1, c1-1, val, fmt)
-                                    for r in range(r0, r1):
-                                        for c in range(c0, c1): written_set.add((r, c))
-                                elif (r0, c0) not in written_set:
-                                    ws.write(r0, c0, val, fmt)
-                                    written_set.add((r0, c0))
+                                    ws.merge_range(r0, c0, r1-1, c1-1, str(val).replace('\n',' '), fmt)
+                                    for r_m in range(r0, r1):
+                                        for c_m in range(c0, c1): written_cells.add((r_m, c_m))
+                                else:
+                                    ws.write(r0, c0, str(val).replace('\n',' '), fmt)
+                                    written_cells.add((r0, c0))
                             except: pass
                         
-                        # 补全可能遗漏的普通单元格
-                        for r_idx, row in enumerate(scheme["rows"]):
-                            for c_idx, val in enumerate(row):
-                                if (r_idx, c_idx) not in written_set:
-                                    fmt = num_fmt if isinstance(val, (int, float)) else text_fmt
-                                    ws.write(r_idx, c_idx, val, fmt)
+                        # B. 写入无缝拼接的数据行 (年度 1 - 105)
+                        h_height = sc["header_height"]
+                        for dr_idx, d_row in enumerate(sc["data_rows"]):
+                            actual_row = h_height + dr_idx
+                            for dc_idx, d_val in enumerate(d_row):
+                                fmt = num_fmt if isinstance(d_val, (int, float)) else text_fmt
+                                ws.write(actual_row, dc_idx, d_val, fmt)
                         
                         ws.set_column(0, 50, 15)
 
                 st.download_button(
-                    label="📥 下载“原样复刻”缝合长表",
+                    label="📥 下载“全量缝合”复印级 Excel",
                     data=output.getvalue(),
-                    file_name="平安建议书长表复刻版.xlsx",
+                    file_name="平安建议书提取_V5.9.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
     except Exception as e:
-        st.error(f"❌ 运行异常: {str(e)}")
+        st.error(f"❌ 程序发生预料外的崩溃: {str(e)}")
+        st.info("提示：请确认 PDF 文件没有被加密，且是直接从平安系统导出的电子版。")
