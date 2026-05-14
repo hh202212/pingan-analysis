@@ -2,12 +2,25 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import io
+import re
 
 # 页面基础配置
 st.set_page_config(page_title="平安建议书对比工具", layout="wide")
 st.title("🛡️ 平安人寿建议书 vs 银行转存一元对比表")
 
-# 侧边栏：输入参数
+# 辅助函数：将字符串彻底转换为数字格式
+def force_numeric(val):
+    if val is None:
+        return 0
+    if isinstance(val, (int, float)):
+        return val
+    # 去掉逗号、百分号、空格和人民币符号
+    clean_val = re.sub(r'[^-0-9.]', '', str(val))
+    try:
+        return float(clean_val) if '.' in clean_val else int(clean_val)
+    except:
+        return val
+
 with st.sidebar:
     st.header("📊 测算参数")
     principal = st.number_input("初始投入总本金 (元)", value=400000, step=10000)
@@ -18,10 +31,10 @@ uploaded_file = st.file_uploader("请上传平安建议书 PDF 文件", type="pd
 
 if uploaded_file:
     try:
-        with st.spinner('正在深度解析 PDF 表格，请稍候...'):
+        with st.spinner('正在深度解析并转换数字格式...'):
             with pdfplumber.open(uploaded_file) as pdf:
                 all_data = []
-                # 遍历建议书核心利益页（通常在10-18页之间）
+                # 遍历核心利益页（通常在10-18页）
                 for page in pdf.pages[10:18]:
                     table = page.extract_table()
                     if table:
@@ -29,27 +42,34 @@ if uploaded_file:
                         all_data.append(df)
                 
                 if not all_data:
-                    st.error("未能识别到利益演示表格，请确认 PDF 是否为官方导出的原件。")
+                    st.error("未能识别到表格。")
                 else:
-                    # 简单展示原始数据，证明“通了”
-                    st.success("解析成功！正在重构对比表格...")
                     full_df = pd.concat(all_data, ignore_index=True)
+                    
+                    # --- 核心转换步骤：把表格里的每一项都尝试转成数字 ---
+                    for col in full_df.columns:
+                        full_df[col] = full_df[col].apply(force_numeric)
                     
                     # 银行动态计算逻辑
                     bank_flows = []
                     curr_bank = principal
                     for year in range(len(full_df)):
                         out_flow = 50000 if year < 8 else 0
+                        # 确保利率计算也是数值运算
                         curr_bank = (curr_bank - out_flow) * (1 + bank_rate)
                         bank_flows.append(round(curr_bank, 2))
                     
                     full_df['银行账户余额'] = bank_flows
+                    
+                    st.success("重构完成！Excel 已转为纯数字格式。")
                     st.dataframe(full_df)
                     
                     # 导出 Excel
                     output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        full_df.to_excel(writer, index=False)
-                    st.download_button("📥 点击下载重构后的 Excel", data=output.getvalue(), file_name="对比分析结果.xlsx")
+                    # 使用 xlsxwriter 引擎确保更好的兼容性
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        full_df.to_excel(writer, index=False, sheet_name='对比分析')
+                    
+                    st.download_button("📥 点击下载纯数字 Excel", data=output.getvalue(), file_name="平安对比分析(纯数字版).xlsx")
     except Exception as e:
         st.error(f"运行出错：{str(e)}")
