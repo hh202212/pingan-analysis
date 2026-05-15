@@ -27,7 +27,6 @@ st.markdown("""
         color: white; 
         border-radius: 8px;
     }
-    /* 强制全局使用思源黑体 */
     html, body, [class*="css"], h1, h2, h3, div, span, p, td, th { 
         font-family: 'Source Han Sans SC', '思源黑体', sans-serif !important; 
     }
@@ -53,46 +52,57 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🛡️ 钱坤大挪移-资产迁移系统 (V8.4 方案锁定版)")
+st.title("🛡️ 钱坤大挪移-资产迁移系统 (V8.5 稳定版)")
 
-# --- 核心辅助：分离方案并只取纯数据 ---
+# --- 核心辅助：分离方案并只取纯数据 (修复云端 NoneType 报错) ---
 def extract_all_schemes(uploaded_file):
     all_schemes = []
     current_scheme_data = []
     
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            tables = page.find_tables()
-            if not tables: continue
-            for t_obj in tables:
-                data = t_obj.extract()
-                if not data: continue
+    # 【核心修复】：将 Streamlit 的上传对象强制转化为纯内存字节流，彻底杜绝指针错误
+    pdf_bytes = io.BytesIO(uploaded_file.getvalue())
+    
+    try:
+        with pdfplumber.open(pdf_bytes) as pdf:
+            # 防崩拦截：如果 PDF 解析失败返回空，直接退出
+            if pdf is None or not hasattr(pdf, 'pages'):
+                return []
                 
-                # 寻找纯数据行起始（第一列是数字）
-                data_start = -1
-                first_year = -1
-                for r_idx, row in enumerate(data):
-                    if row[0] and str(row[0]).strip().isdigit():
-                        data_start = r_idx
-                        first_year = int(str(row[0]).strip())
-                        break
-                
-                if data_start != -1:
-                    is_new_scheme = (first_year == 1)
+            for page in pdf.pages:
+                tables = page.find_tables()
+                if not tables: continue
+                for t_obj in tables:
+                    data = t_obj.extract()
+                    if not data: continue
                     
-                    if is_new_scheme:
-                        # 结算上一个方案
-                        if current_scheme_data:
-                            all_schemes.append(current_scheme_data)
-                        # 开启新方案，只拿数据行
-                        current_scheme_data = data[data_start:]
-                    elif current_scheme_data is not None:
-                        # 续表，直接拼接数据行
-                        current_scheme_data.extend(data[data_start:])
+                    # 寻找纯数据行起始（第一列是数字）
+                    data_start = -1
+                    first_year = -1
+                    for r_idx, row in enumerate(data):
+                        if row[0] and str(row[0]).strip().isdigit():
+                            data_start = r_idx
+                            first_year = int(str(row[0]).strip())
+                            break
+                    
+                    if data_start != -1:
+                        is_new_scheme = (first_year == 1)
                         
-        if current_scheme_data:
-            all_schemes.append(current_scheme_data)
-            
+                        if is_new_scheme:
+                            # 结算上一个方案
+                            if current_scheme_data:
+                                all_schemes.append(current_scheme_data)
+                            # 开启新方案，只拿数据行
+                            current_scheme_data = data[data_start:]
+                        elif current_scheme_data is not None:
+                            # 续表，直接拼接数据行
+                            current_scheme_data.extend(data[data_start:])
+                            
+            if current_scheme_data:
+                all_schemes.append(current_scheme_data)
+                
+    except Exception as e:
+        st.error(f"PDF 底层解析失败: {e}")
+        
     return all_schemes
 
 # --- 2. 界面布局 ---
@@ -123,10 +133,10 @@ if start_calc and pdf_file and has_template:
             all_schemes = extract_all_schemes(pdf_file)
             
             if not all_schemes:
-                st.error("未能识别到 PDF 里的纯数据行，请检查原件。")
+                st.error("未能识别到 PDF 里的纯数据行，请确认 PDF 文件是否损坏或加密。")
                 st.stop()
             
-            # 【核心改进】：精准提取方案 2
+            # 精准提取方案 2
             if len(all_schemes) >= 2:
                 matrix_data = all_schemes[1]  # 索引 1 对应方案 2
                 st.toast("🎯 已成功锁定并提取【方案 2】数据")
