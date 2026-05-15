@@ -3,3 +3,8 @@ pdfplumber
 pandas
 openpyxl
 xlsxwriter
+streamlit
+pdfplumber
+pandas
+openpyxl
+dataframe_image
